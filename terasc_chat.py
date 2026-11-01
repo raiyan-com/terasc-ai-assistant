@@ -226,7 +226,7 @@ def render_chat(context=None, key="terasc_chat", height=460, style=True):
 
     title_col, clear_col = st.columns([5, 1], vertical_alignment="center")
     title_col.markdown("#### 🤖 TER-ASC AI Assistant")
-    if messages and clear_col.button("Clear chat", key=f"{key}_clear"):
+    if messages and clear_col.button("Clear", key=f"{key}_clear", help="Clear the chat"):
         st.session_state[messages_key] = []
         st.rerun()
 
