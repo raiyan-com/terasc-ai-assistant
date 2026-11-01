@@ -18,9 +18,12 @@ import streamlit as st
 from google import genai
 from google.genai import errors, types
 
-# Tried in order. Free-tier limits are per model, so when one runs out we move on.
-MODELS = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"]
-TIMEOUT_SECONDS = 20  # a model that stays silent this long is skipped for the next one
+# Tried in order; when one is busy or out of free quota we move on. On the free tier,
+# 3.8 Flash often didn't answer within the timeout, so faster models come first.
+MODELS = ["gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-3.8-flash"]
+TIMEOUT_SECONDS = 10  # a model that stays silent this long is skipped for the next one
+COOLDOWN_SECONDS = 300  # after a model is busy or times out, skip it for this long
+_cooldown_until = {}  # model -> time.monotonic() it may be tried again (shared by all visitors)
 HISTORY_SENT = 12  # how many recent messages the model sees
 MAX_QUESTIONS_PER_SESSION = 40  # protects the shared free quota on a public site
 
@@ -172,7 +175,11 @@ def _system_prompt(context):
 
 
 def _stream_reply(api_key, system, history):
-    """Yield the answer text, trying each model in MODELS until one works."""
+    """Yield the answer text, trying each model in MODELS until one works.
+
+    Yields None when a model fails mid-answer: the text so far should be discarded,
+    because the next model starts the answer over.
+    """
     history = history[-HISTORY_SENT:]
     while history and history[0]["role"] != "user":  # Gemini expects a user turn first
         history = history[1:]
@@ -185,7 +192,9 @@ def _stream_reply(api_key, system, history):
     ]
     client = _client(api_key)
     last_error = None
-    for model in MODELS:
+    now = time.monotonic()
+    available = [m for m in MODELS if _cooldown_until.get(m, 0) <= now] or MODELS
+    for model in available:
         # Low thinking keeps replies fast; retry without it if a model rejects the setting.
         for thinking in (types.ThinkingConfig(thinking_level="low"), None):
             config = types.GenerateContentConfig(system_instruction=system, thinking_config=thinking)
@@ -203,17 +212,35 @@ def _stream_reply(api_key, system, history):
             except (errors.APIError, httpx.TransportError) as e:  # TransportError covers timeouts
                 code = getattr(e, "code", None)
                 _log(model, thinking, f"failed ({code or type(e).__name__}: {str(e)[:150]})", start)
-                if sent_text:
-                    raise ChatError("The answer was cut off. Please ask again.") from e
                 last_error = e
                 if code in (401, 403) or "API key" in str(e):
                     raise ChatError("The Gemini API key is missing or invalid. Check GEMINI_API_KEY.") from e
-                if code == 400 and thinking is not None:
+                if code == 400 and thinking is not None and not sent_text:
                     continue
-                break  # quota, overload, timeout or unknown model: try the next model
+                if code is None or code == 429 or code >= 500:  # timeout, quota or overload
+                    _cooldown_until[model] = time.monotonic() + COOLDOWN_SECONDS
+                if sent_text:
+                    yield None  # the next model starts the answer over
+                break  # try the next model
     if getattr(last_error, "code", None) == 429:
         raise ChatError("The free AI quota is used up for the moment. Please try again in a minute.")
     raise ChatError("The AI service is not responding right now. Please try again shortly.") from last_error
+
+
+def _write_stream(chunks):
+    """Like st.write_stream, but shows progress first and lets a None chunk restart the text."""
+    placeholder = st.empty()
+    placeholder.markdown("_Thinking…_")
+    text = ""
+    try:
+        for chunk in chunks:
+            text = "" if chunk is None else text + chunk
+            placeholder.markdown(f"{text} ▌" if text else "_Thinking…_")
+    except ChatError:
+        placeholder.empty()
+        raise
+    placeholder.markdown(text)
+    return text
 
 
 def _inject_style():
@@ -285,7 +312,7 @@ def render_chat(context=None, key="terasc_chat", height=460, style=True):
         st.chat_message("user", avatar="👷").markdown(prompt)
         with st.chat_message("assistant", avatar="🤖"):
             try:
-                reply = st.write_stream(_stream_reply(api_key, _system_prompt(context), messages))
+                reply = _write_stream(_stream_reply(api_key, _system_prompt(context), messages))
             except ChatError as e:
                 messages.pop()  # let the user ask the same question again
                 st.error(str(e))
