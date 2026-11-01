@@ -5,9 +5,11 @@ It explains PET, PMV, PPD, SET, RWS and CE, the heat-risk levels, the work-rest 
 hydration guidance, and how to use the app. When it is given the current inputs and
 predictions, it answers about the user's own situation ("what do my results mean?").
 
-It runs on **Google Gemini 3.8 Flash**, Google's strongest model on the free tier
-(no credit card needed). If that model hits its free limit, it automatically falls back
-to Gemini 3.6 Flash, then Gemini 3.5 Flash-Lite.
+It runs on **Google Gemini's free tier** (no credit card needed): Gemini 3.6 Flash first,
+then Gemini 3.5 Flash-Lite and Gemini 3.8 Flash as backups. 3.8 Flash is Google's strongest
+free model, but on the free tier it was often too busy to answer within 10 seconds, so the
+faster models go first. A model that is busy, out of quota or silent for 10 seconds is
+skipped for 5 minutes, and if one fails mid-answer the next one starts the answer over.
 
 | File | What it is |
 |---|---|
@@ -94,5 +96,9 @@ chat box height in pixels. Set `style=False` to keep the app's own chat-bubble s
 - **What it knows.** The app's facts, thresholds and safety guidance are written into
   `SYSTEM_PROMPT` in `terasc_chat.py`. If the app's rules change, update that text.
 - **Changing the model.** Edit the `MODELS` list at the top of `terasc_chat.py`.
+- **Speed.** Each answer writes a line like `[terasc_chat] gemini-3.6-flash ... first text after 0.8s`
+  to the app logs (Streamlit Cloud: **Manage app**), showing which model answered and how fast.
+  Opening the page itself takes a few seconds on Streamlit's free hosting, and longer
+  (about 30 s) if the app was asleep after a period with no visitors.
 - AI answers can be wrong. The assistant tells users it is not medical advice and to
   call 911 for suspected heat stroke.
