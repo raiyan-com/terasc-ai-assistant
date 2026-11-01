@@ -11,13 +11,16 @@ GEMINI_API_KEY environment variable (get one at https://aistudio.google.com/apik
 """
 
 import os
+import time
 
+import httpx
 import streamlit as st
 from google import genai
 from google.genai import errors, types
 
 # Tried in order. Free-tier limits are per model, so when one runs out we move on.
 MODELS = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"]
+TIMEOUT_SECONDS = 20  # a model that stays silent this long is skipped for the next one
 HISTORY_SENT = 12  # how many recent messages the model sees
 MAX_QUESTIONS_PER_SESSION = 40  # protects the shared free quota on a public site
 
@@ -149,7 +152,12 @@ def _api_key():
 
 @st.cache_resource(show_spinner=False)
 def _client(api_key):
-    return genai.Client(api_key=api_key)
+    return genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=TIMEOUT_SECONDS * 1000))
+
+
+def _log(model, thinking, event, start):
+    # Shows up in the app logs (Streamlit Cloud: Manage app), to see which model answered and how fast.
+    print(f"[terasc_chat] {model} thinking={'low' if thinking else 'default'}: {event} after {time.monotonic() - start:.1f}s", flush=True)
 
 
 def _fmt(value):
@@ -182,22 +190,28 @@ def _stream_reply(api_key, system, history):
         for thinking in (types.ThinkingConfig(thinking_level="low"), None):
             config = types.GenerateContentConfig(system_instruction=system, thinking_config=thinking)
             sent_text = False
+            start = time.monotonic()
             try:
                 for chunk in client.models.generate_content_stream(model=model, contents=contents, config=config):
                     if chunk.text:
+                        if not sent_text:
+                            _log(model, thinking, "first text", start)
                         sent_text = True
                         yield chunk.text
+                _log(model, thinking, "done", start)
                 return
-            except errors.APIError as e:
+            except (errors.APIError, httpx.TransportError) as e:  # TransportError covers timeouts
+                code = getattr(e, "code", None)
+                _log(model, thinking, f"failed ({code or type(e).__name__}: {str(e)[:150]})", start)
                 if sent_text:
                     raise ChatError("The answer was cut off. Please ask again.") from e
                 last_error = e
-                if e.code in (401, 403) or "API key" in str(e):
+                if code in (401, 403) or "API key" in str(e):
                     raise ChatError("The Gemini API key is missing or invalid. Check GEMINI_API_KEY.") from e
-                if e.code == 400 and thinking is not None:
+                if code == 400 and thinking is not None:
                     continue
-                break  # quota, overload or unknown model: try the next model
-    if last_error is not None and last_error.code == 429:
+                break  # quota, overload, timeout or unknown model: try the next model
+    if getattr(last_error, "code", None) == 429:
         raise ChatError("The free AI quota is used up for the moment. Please try again in a minute.")
     raise ChatError("The AI service is not responding right now. Please try again shortly.") from last_error
 
@@ -264,6 +278,8 @@ def render_chat(context=None, key="terasc_chat", height=460, style=True):
         st.info("You've reached the question limit for this session. Clear the chat to start over.")
         return
 
+    if messages and messages[-1]["role"] == "user":
+        messages.pop()  # an earlier question was interrupted before its answer arrived
     messages.append({"role": "user", "content": prompt})
     with box:
         st.chat_message("user", avatar="👷").markdown(prompt)
