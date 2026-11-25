@@ -13,7 +13,6 @@ GEMINI_API_KEY environment variable (get one at https://aistudio.google.com/apik
 import os
 import time
 
-import httpx
 import streamlit as st
 from google import genai
 from google.genai import errors, types
@@ -209,7 +208,7 @@ def _stream_reply(api_key, system, history):
                         yield chunk.text
                 _log(model, thinking, "done", start)
                 return
-            except (errors.APIError, httpx.TransportError) as e:  # TransportError covers timeouts
+            except Exception as e:  # API errors plus timeouts and network errors from any SDK transport
                 code = getattr(e, "code", None)
                 _log(model, thinking, f"failed ({code or type(e).__name__}: {str(e)[:150]})", start)
                 last_error = e
