@@ -223,7 +223,8 @@ def _stream_reply(api_key, system, history):
                 break  # try the next model
     if getattr(last_error, "code", None) == 429:
         raise ChatError("The free AI quota is used up for the moment. Please try again in a minute.")
-    raise ChatError("The AI service is not responding right now. Please try again shortly.") from last_error
+    detail = getattr(last_error, "code", None) or type(last_error).__name__
+    raise ChatError(f"The AI service is not responding right now ({detail}). Please try again shortly.") from last_error
 
 
 def _write_stream(chunks):
