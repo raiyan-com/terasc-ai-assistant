@@ -17,10 +17,12 @@ import streamlit as st
 from google import genai
 from google.genai import errors, types
 
-# Tried in order; when one is busy or out of free quota we move on. On the free tier,
-# 3.8 Flash often didn't answer within the timeout, so faster models come first.
-MODELS = ["gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-3.8-flash"]
+# Tried in order; when one is busy or out of free quota we move on. All are on the free
+# tier. 3.8 Flash often didn't answer within the timeout, so faster models come first.
+MODELS = ["gemini-3.6-flash", "gemini-4-hydrogen", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.8-flash"]
 TIMEOUT_SECONDS = 10  # a model that stays silent this long is skipped for the next one
+RETRY_ROUNDS = 3  # if every model is busy, wait a little and go through them again
+ANSWER_BUDGET_SECONDS = 30  # stop trying new models after this long
 COOLDOWN_SECONDS = 300  # after a model is busy or times out, skip it for this long
 _cooldown_until = {}  # model -> time.monotonic() it may be tried again (shared by all visitors)
 HISTORY_SENT = 12  # how many recent messages the model sees
@@ -191,36 +193,46 @@ def _stream_reply(api_key, system, history):
     ]
     client = _client(api_key)
     last_error = None
-    now = time.monotonic()
-    available = [m for m in MODELS if _cooldown_until.get(m, 0) <= now] or MODELS
-    for model in available:
-        # Low thinking keeps replies fast; retry without it if a model rejects the setting.
-        for thinking in (types.ThinkingConfig(thinking_level="low"), None):
-            config = types.GenerateContentConfig(system_instruction=system, thinking_config=thinking)
-            sent_text = False
-            start = time.monotonic()
-            try:
-                for chunk in client.models.generate_content_stream(model=model, contents=contents, config=config):
-                    if chunk.text:
-                        if not sent_text:
-                            _log(model, thinking, "first text", start)
-                        sent_text = True
-                        yield chunk.text
-                _log(model, thinking, "done", start)
-                return
-            except Exception as e:  # API errors plus timeouts and network errors from any SDK transport
-                code = getattr(e, "code", None)
-                _log(model, thinking, f"failed ({code or type(e).__name__}: {str(e)[:150]})", start)
-                last_error = e
-                if code in (401, 403) or "API key" in str(e):
-                    raise ChatError("The Gemini API key is missing or invalid. Check GEMINI_API_KEY.") from e
-                if code == 400 and thinking is not None and not sent_text:
-                    continue
-                if code is None or code == 429 or code >= 500:  # timeout, quota or overload
-                    _cooldown_until[model] = time.monotonic() + COOLDOWN_SECONDS
-                if sent_text:
-                    yield None  # the next model starts the answer over
-                break  # try the next model
+    deadline = time.monotonic() + ANSWER_BUDGET_SECONDS
+    for round_number in range(RETRY_ROUNDS):
+        if round_number:
+            time.sleep(2 * round_number)  # busy spells on the free tier are usually brief
+        now = time.monotonic()
+        # The first round skips models that were busy recently; later rounds try them all.
+        models = [m for m in MODELS if _cooldown_until.get(m, 0) <= now] if round_number == 0 else MODELS
+        for model in models or MODELS:
+            if time.monotonic() > deadline:
+                break
+            # Low thinking keeps replies fast; retry without it if a model rejects the setting.
+            for thinking in (types.ThinkingConfig(thinking_level="low"), None):
+                config = types.GenerateContentConfig(system_instruction=system, thinking_config=thinking)
+                sent_text = False
+                start = time.monotonic()
+                try:
+                    for chunk in client.models.generate_content_stream(model=model, contents=contents, config=config):
+                        if chunk.text:
+                            if not sent_text:
+                                _log(model, thinking, "first text", start)
+                            sent_text = True
+                            yield chunk.text
+                    _log(model, thinking, "done", start)
+                    return
+                except Exception as e:  # API errors plus timeouts and network errors from any SDK transport
+                    code = getattr(e, "code", None)
+                    _log(model, thinking, f"failed ({code or type(e).__name__}: {str(e)[:150]})", start)
+                    last_error = e
+                    if code in (401, 403) or "API key" in str(e):
+                        raise ChatError("The Gemini API key is missing or invalid. Check GEMINI_API_KEY.") from e
+                    if code == 400 and thinking is not None and not sent_text:
+                        continue
+                    if code is None or code == 429 or code >= 500:  # timeout, quota or overload
+                        _cooldown_until[model] = time.monotonic() + COOLDOWN_SECONDS
+                    if sent_text:
+                        yield None  # the next model starts the answer over
+                    break  # try the next model
+        code = getattr(last_error, "code", None)
+        if (code is not None and code != 429 and code < 500) or time.monotonic() > deadline:
+            break  # not a busy/timeout problem, or out of time: retrying won't help
     if getattr(last_error, "code", None) == 429:
         raise ChatError("The free AI quota is used up for the moment. Please try again in a minute.")
     detail = getattr(last_error, "code", None) or type(last_error).__name__
